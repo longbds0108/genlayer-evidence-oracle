@@ -1,0 +1,14 @@
+{
+  "name": "genlayer-evidence-oracle",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Read the live GitHub Evidence Oracle contracts on GenLayer Bradbury.",
+  "scripts": {
+    "inspect": "node scripts/inspect.mjs",
+    "test": "cd tests && python3 -m unittest -v"
+  },
+  "dependencies": {
+    "genlayer-js": "2.0.0-rc.3"
+  }
+}
