@@ -13,8 +13,8 @@ Live on **GenLayer Bradbury testnet (chain 4221)**:
 
 | Contract | Address |
 |---|---|
-| `EvidenceOracle` | `0xAc46eBFC51A34f171AB9E0146a62F4f0df8a541A` |
-| `BountyBoard` (example consumer) | `0xB7C85027b8D16D3e50413E8F3761D477c7375168` |
+| `EvidenceOracle` | [`0xAc46eBFC51A34f171AB9E0146a62F4f0df8a541A`](https://scan.bradbury.genlayer.com/address/0xAc46eBFC51A34f171AB9E0146a62F4f0df8a541A) |
+| `BountyBoard` (example consumer) | [`0xB7C85027b8D16D3e50413E8F3761D477c7375168`](https://scan.bradbury.genlayer.com/address/0xB7C85027b8D16D3e50413E8F3761D477c7375168) |
 
 ## Why commit-pinned evidence
 
