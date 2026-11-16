@@ -3,15 +3,17 @@
 //   npm install
 //   node scripts/inspect.mjs                # list every oracle check and task
 //   node scripts/inspect.mjs <check_id>     # one check, plus a local hash re-check
+//   node scripts/inspect.mjs --source       # compare deployed code with contracts/
 //
 // No wallet is needed: these are view calls.
 
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { createClient } from 'genlayer-js';
 import { testnetBradbury } from 'genlayer-js/chains';
 
-const ORACLE = '0xAc46eBFC51A34f171AB9E0146a62F4f0df8a541A';
-const BOARD = '0xB7C85027b8D16D3e50413E8F3761D477c7375168';
+const ORACLE = '0x597D7D61532D83385Aa112cD80B7f5BD7bA164c0';
+const BOARD = '0x9895025f21fD990F81671908750cCfCb17562B75';
 // The public chain RPC does not serve gen_call; the GenLayer node RPC does.
 const client = createClient({ chain: testnetBradbury, endpoint: 'https://rpc-bradbury.genlayer.com' });
 
@@ -26,8 +28,20 @@ async function recheckHash(check) {
   return { url, local, matches: local === check.content_hash };
 }
 
+const sha = (data) => createHash('sha256').update(data).digest('hex');
+
+async function compareSource(address, file) {
+  const deployed = await client.getContractCode(address);
+  const text = typeof deployed === 'string' ? deployed : new TextDecoder().decode(deployed);
+  const local = readFileSync(new URL(`../contracts/${file}`, import.meta.url), 'utf8');
+  console.log(`${file}\n  deployed ${address}  sha256 ${sha(text)}\n  repo     contracts/${file}  sha256 ${sha(local)}\n  ${text === local ? 'IDENTICAL' : 'DIFFERENT'}`);
+}
+
 const wanted = process.argv[2];
-if (wanted) {
+if (wanted === '--source') {
+  await compareSource(ORACLE, 'evidence_oracle.py');
+  await compareSource(BOARD, 'bounty_board.py');
+} else if (wanted) {
   const check = await read(ORACLE, 'get_check', [wanted]);
   console.log(check);
   if (check.http_status === '200') console.log(await recheckHash(check));
@@ -43,6 +57,6 @@ if (wanted) {
   console.log(`BountyBoard ${BOARD}: ${tasks} tasks`);
   for (let i = 1; i <= tasks; i++) {
     const t = await read(BOARD, 'get_task', [`T${i}`]);
-    console.log(`  ${t.task_id}  ${t.status.padEnd(6)} ${t.reward_points} pts  solver=${t.solver || '-'}  "${t.requirement}"`);
+    console.log(`  ${t.task_id}  ${t.status.padEnd(6)} ${t.reward_points} pts  assignee=${t.assignee || '-'}  solver=${t.solver || '-'}  "${t.requirement}"`);
   }
 }

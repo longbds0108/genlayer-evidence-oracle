@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from fake_genlayer import WORLD, UserError, deploy, load_contract
+from fake_genlayer import WORLD, Address, UserError, deploy, load_contract
 
 oracle_mod = load_contract("evidence_oracle.py")
 board_mod = load_contract("bounty_board.py")
@@ -10,6 +10,7 @@ ORACLE_ADDR = "0x" + "aa" * 20
 BOARD_ADDR = "0x" + "bb" * 20
 SPONSOR = "0x" + "51" * 20
 SOLVER = "0x" + "5A" * 20
+THIEF = "0x" + "77" * 20
 OWNER, REPO, PATH = "acme", "widgets", "README.md"
 REQUIREMENT = "The README explains how to run the tests."
 GOOD = "1" * 40
@@ -31,7 +32,7 @@ class BountyBoardTest(unittest.TestCase):
         self.oracle = deploy(oracle_mod.EvidenceOracle, ORACLE_ADDR)
         self.board = deploy(board_mod.BountyBoard, BOARD_ADDR, ORACLE_ADDR)
         WORLD.sender = SPONSOR
-        self.task_id = self.board.create_task(OWNER, REPO, PATH, REQUIREMENT, 50)
+        self.task_id = self.board.create_task(OWNER, REPO, PATH, REQUIREMENT, 50, SOLVER)
 
     def solve(self, commit):
         WORLD.sender = SOLVER
@@ -40,12 +41,51 @@ class BountyBoardTest(unittest.TestCase):
 
     def test_create_task_records_sponsor_and_rejects_bad_input(self):
         task = self.board.get_task(self.task_id)
-        self.assertEqual((task["status"], task["sponsor"], task["reward_points"]), ("OPEN", SPONSOR, "50"))
+        self.assertEqual(
+            (task["status"], task["sponsor"], task["reward_points"], task["assignee"]),
+            ("OPEN", SPONSOR, "50", SOLVER),
+        )
         self.assertEqual(self.board.get_oracle(), ORACLE_ADDR)
         with self.assertRaises(UserError):
-            self.board.create_task(OWNER, REPO, "../x", REQUIREMENT, 10)
+            self.board.create_task(OWNER, REPO, "../x", REQUIREMENT, 10, SOLVER)
         with self.assertRaises(UserError):
-            self.board.create_task(OWNER, REPO, PATH, REQUIREMENT, 0)
+            self.board.create_task(OWNER, REPO, PATH, REQUIREMENT, 0, SOLVER)
+        with self.assertRaisesRegex(UserError, "wallet"):
+            self.board.create_task(OWNER, REPO, PATH, REQUIREMENT, 10, "not-an-address")
+
+    def test_wallets_are_accepted_as_hex_strings_or_address_values(self):
+        WORLD.sender = SPONSOR
+        as_address = self.board.create_task(OWNER, REPO, PATH, REQUIREMENT, 5, Address(SOLVER))
+        self.assertEqual(self.board.get_task(as_address)["assignee"], SOLVER)
+        padded = self.board.create_task(OWNER, REPO, PATH, REQUIREMENT, 5, "  " + SOLVER + " ")
+        self.assertEqual(self.board.get_task(padded)["assignee"], SOLVER)
+        self.assertEqual(self.board.assign_task(padded, Address(THIEF))["assignee"], THIEF)
+
+    def test_other_wallets_cannot_take_credit_for_a_public_commit(self):
+        WORLD.sender = THIEF
+        self.oracle.verify(OWNER, REPO, GOOD, PATH, REQUIREMENT)  # anyone may pay for the check
+        with self.assertRaisesRegex(UserError, "Only the assigned solver"):
+            self.board.claim_task(self.task_id, GOOD)
+        self.assertEqual(self.board.get_reputation(THIEF), 0)
+        # The assigned solver can still claim, reusing the cached check.
+        WORLD.sender = SOLVER
+        self.assertEqual(self.board.claim_task(self.task_id, GOOD)["solver"], SOLVER)
+
+    def test_unassigned_task_needs_the_sponsor_to_assign_first(self):
+        WORLD.sender = SPONSOR
+        task_id = self.board.create_task(OWNER, REPO, PATH, REQUIREMENT, 5, "")
+        WORLD.sender = SOLVER
+        self.oracle.verify(OWNER, REPO, GOOD, PATH, REQUIREMENT)
+        with self.assertRaisesRegex(UserError, "no assigned solver"):
+            self.board.claim_task(task_id, GOOD)
+        with self.assertRaisesRegex(UserError, "Only the sponsor"):
+            self.board.assign_task(task_id, SOLVER)
+        WORLD.sender = SPONSOR
+        self.assertEqual(self.board.assign_task(task_id, SOLVER)["assignee"], SOLVER)
+        WORLD.sender = SOLVER
+        self.assertEqual(self.board.claim_task(task_id, GOOD)["status"], "SOLVED")
+        with self.assertRaisesRegex(UserError, "already solved"):
+            self.board.assign_task(task_id, THIEF)
 
     def test_supported_check_solves_task_and_pays_reputation(self):
         task = self.solve(GOOD)

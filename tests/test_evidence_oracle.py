@@ -112,6 +112,7 @@ class VerifyFlow(OracleTestCase):
         self.assertEqual(record["http_status"], "200")
         self.assertEqual(record["requester"], WORLD.sender)
         self.assertEqual(self.oracle.get_check_count(), 1)
+        self.assertEqual(record["stored"], "true")
         self.assertEqual(self.oracle.get_check(record["check_id"]), record)
         self.assertEqual(self.oracle.get_check_id_at(0), record["check_id"])
 
@@ -131,6 +132,44 @@ class VerifyFlow(OracleTestCase):
         self.assertEqual(record["http_status"], "404")
         self.assertEqual(record["content_hash"], "")
         self.assertEqual(WORLD.calls["llm"], 0)
+
+    def test_unavailable_is_not_cached_so_it_can_be_retried(self):
+        WORLD.web[URL] = (503, b"Service Unavailable")
+        first = self.verify()
+        self.assertEqual((first["verdict"], first["stored"]), ("UNAVAILABLE", "false"))
+        self.assertFalse(self.oracle.has_check(first["check_id"]))
+        self.assertEqual(self.oracle.get_check_count(), 0)
+
+        WORLD.web[URL] = (200, README)  # GitHub recovers
+        WORLD.llm = llm_says("SUPPORTED")
+        retry = self.verify()
+        self.assertEqual((retry["verdict"], retry["stored"]), ("SUPPORTED", "true"))
+        self.assertEqual(retry["check_id"], first["check_id"])
+        self.assertEqual(self.oracle.get_check_count(), 1)
+
+    def test_file_over_the_evidence_limit_is_rejected_not_judged(self):
+        limit = self.oracle.get_evidence_limit()
+        WORLD.web[URL] = (200, b"a" * limit + b"\nThe deciding line is at the end.\n")
+        WORLD.llm = llm_says("SUPPORTED")
+        with self.assertRaisesRegex(UserError, "larger than"):
+            self.verify()
+        self.assertEqual(WORLD.calls["llm"], 0)  # the model never saw a partial file
+        self.assertEqual(self.oracle.get_check_count(), 0)
+
+    def test_file_at_the_limit_is_judged_whole(self):
+        limit = self.oracle.get_evidence_limit()
+        body = b"b" * (limit - 20) + b"\nends with marker\n"
+        self.assertLessEqual(len(body.decode()), limit)
+        WORLD.web[URL] = (200, body)
+        seen = []
+
+        def model(prompt):
+            seen.append(prompt)
+            return json.dumps({"verdict": "SUPPORTED", "reason": "ok"})
+
+        WORLD.llm = model
+        self.assertEqual(self.verify()["verdict"], "SUPPORTED")
+        self.assertTrue(seen and all("ends with marker" in p for p in seen))
 
     def test_unknown_lookups_fail_cleanly(self):
         self.assertFalse(self.oracle.has_check("nope"))
@@ -168,13 +207,25 @@ class ValidatorRule(OracleTestCase):
             self.verify()
         self.assertEqual(WORLD.calls["llm"], 1)  # leader only
 
+    def test_reject_leader_that_judges_an_oversized_file(self):
+        big = {"http_status": "200", "content_hash": "h", "char_count": 20000, "text": ""}
+        partial = {"verdict": "SUPPORTED", "reason": "first part looked fine", "content_hash": "h", "http_status": "200"}
+        self.assertFalse(oracle_mod.validator_agrees(partial, big, lambda: self.fail("model must not run")))
+        refusal = dict(partial, verdict="TOO_LARGE", reason="too big")
+        self.assertTrue(oracle_mod.validator_agrees(refusal, big, lambda: self.fail("model must not run")))
+
+    def test_reject_leader_that_refuses_a_file_that_fits(self):
+        small = {"http_status": "200", "content_hash": "h", "char_count": 10, "text": "tiny"}
+        refusal = {"verdict": "TOO_LARGE", "reason": "too big", "content_hash": "h", "http_status": "200"}
+        self.assertFalse(oracle_mod.validator_agrees(refusal, small, lambda: "SUPPORTED"))
+
     def test_reject_leader_that_hides_an_outage(self):
-        obs = {"http_status": "404", "content_hash": "", "text": ""}
+        obs = {"http_status": "404", "content_hash": "", "char_count": 0, "text": ""}
         forged = {"verdict": "SUPPORTED", "reason": "trust me", "content_hash": "", "http_status": "404"}
         self.assertFalse(oracle_mod.validator_agrees(forged, obs, lambda: "SUPPORTED"))
 
     def test_reject_malformed_or_oversized_leader_results(self):
-        obs = {"http_status": "200", "content_hash": "h", "text": "t"}
+        obs = {"http_status": "200", "content_hash": "h", "char_count": 1, "text": "t"}
         good = {"verdict": "SUPPORTED", "reason": "ok", "content_hash": "h", "http_status": "200"}
         self.assertTrue(oracle_mod.validator_agrees(good, obs, lambda: "SUPPORTED"))
         bad_cases = [
@@ -190,7 +241,7 @@ class ValidatorRule(OracleTestCase):
                 self.assertFalse(oracle_mod.validator_agrees(bad, obs, lambda: "SUPPORTED"))
 
     def test_agree_on_shared_outage(self):
-        obs = {"http_status": "404", "content_hash": "", "text": ""}
+        obs = {"http_status": "404", "content_hash": "", "char_count": 0, "text": ""}
         leader = {"verdict": "UNAVAILABLE", "reason": "404", "content_hash": "", "http_status": "404"}
         self.assertTrue(oracle_mod.validator_agrees(leader, obs, lambda: self.fail("model must not run")))
 

@@ -1,6 +1,6 @@
 # { "Depends": "py-genlayer:babwp9t37jw9g4j2bccgn14g6x7x9s1f7dsmh7emvz735pz4zxa0" }
 
-# GitHub Evidence Oracle v1.0.0
+# GitHub Evidence Oracle v1.1.0
 #
 # Answers "does this file, at this exact commit, support this claim?" and
 # stores the answer so any contract or app can reuse it.
@@ -19,8 +19,12 @@ from genlayer.types import *
 
 
 VERDICTS = ("SUPPORTED", "REFUTED", "INSUFFICIENT")
+# Outcomes that are not a judgement of the claim. Neither is ever stored:
+# UNAVAILABLE may be a transient fetch failure, and TOO_LARGE means the model
+# would not see the whole file, so no whole-file verdict may be issued.
 UNAVAILABLE = "UNAVAILABLE"
-ALL_VERDICTS = VERDICTS + (UNAVAILABLE,)
+TOO_LARGE = "TOO_LARGE"
+ALL_VERDICTS = VERDICTS + (UNAVAILABLE, TOO_LARGE)
 
 MAX_CLAIM_CHARS = 500
 MAX_PATH_CHARS = 300
@@ -120,7 +124,11 @@ def parse_verdict(raw: str) -> tuple:
 
 
 def observe(url: str) -> dict:
-    """Fetch the pinned file. Returns status, sha256 of the raw bytes, and text."""
+    """Fetch the pinned file. Returns status, sha256 of the raw bytes, size and text.
+
+    The text is only kept when the whole file fits in the model's evidence
+    window; a file is never truncated.
+    """
     try:
         response = gl.nondet.web.get(url)
         status = int(response.status)
@@ -128,17 +136,30 @@ def observe(url: str) -> dict:
     except Exception:
         status = 0
         body = b""
+    if status != 200:
+        return {"http_status": str(status), "content_hash": "", "char_count": 0, "text": ""}
+    text = body.decode("utf-8", errors="replace")
+    fits = len(text) <= MAX_EVIDENCE_CHARS
     return {
-        "http_status": str(status),
-        "content_hash": hashlib.sha256(body).hexdigest() if status == 200 else "",
-        "text": body.decode("utf-8", errors="replace")[:MAX_EVIDENCE_CHARS] if status == 200 else "",
+        "http_status": "200",
+        "content_hash": hashlib.sha256(body).hexdigest(),
+        "char_count": len(text),
+        "text": text if fits else "",
     }
 
 
 def judge(claim: str, path: str, observation: dict) -> tuple:
-    """Ask the model for a verdict on fetched evidence."""
+    """Ask the model for a verdict on the whole fetched file."""
     if observation["http_status"] != "200":
         return UNAVAILABLE, "The pinned file could not be fetched (HTTP " + observation["http_status"] + ")."
+    if observation["char_count"] > MAX_EVIDENCE_CHARS:
+        return TOO_LARGE, (
+            "The file has "
+            + str(observation["char_count"])
+            + " characters; the limit is "
+            + str(MAX_EVIDENCE_CHARS)
+            + "."
+        )
     return parse_verdict(gl.nondet.exec_prompt(build_prompt(claim, path, observation["text"])))
 
 
@@ -172,7 +193,13 @@ def validator_agrees(leader_result, own_observation: dict, own_verdict) -> bool:
         return False
     if leader_result["verdict"] == UNAVAILABLE:
         return True
-    # Same bytes, so the verdict is the only judgement left to compare.
+    # Same bytes, so whether the file fits the evidence window is a fact every
+    # node computes identically. A leader may neither judge an oversized file
+    # (it could only have seen part of it) nor refuse one that fits.
+    too_large = own_observation["char_count"] > MAX_EVIDENCE_CHARS
+    if too_large or leader_result["verdict"] == TOO_LARGE:
+        return too_large and leader_result["verdict"] == TOO_LARGE
+    # Only the judgement itself is left to compare.
     return own_verdict() == leader_result["verdict"]
 
 
@@ -209,7 +236,12 @@ class EvidenceOracle(gl.contract.Contract):
 
     @gl.public.write
     def verify(self, owner: str, repo: str, commit: str, path: str, claim: str) -> dict[str, str]:
-        """Verify a claim, or return the stored answer if it was asked before."""
+        """Verify a claim, or return the stored answer if it was asked before.
+
+        Only SUPPORTED, REFUTED and INSUFFICIENT are stored. UNAVAILABLE is
+        returned with stored="false" so the same check can be retried, and a
+        file larger than the evidence window is rejected with an error.
+        """
         owner, repo, commit, path, claim = normalize_request(owner, repo, commit, path, claim)
         check_id = compute_check_id(owner, repo, commit, path, claim)
         existing = self.checks.get(check_id)
@@ -240,6 +272,13 @@ class EvidenceOracle(gl.contract.Contract):
 
         result = gl.vm.run_nondet(leader, validator)
 
+        if result["verdict"] == TOO_LARGE:
+            raise gl.vm.UserError(
+                "Evidence file is larger than "
+                + str(MAX_EVIDENCE_CHARS)
+                + " characters; point the check at a smaller file"
+            )
+
         record = Check(
             check_id=check_id,
             requester=gl.message.sender_address.as_hex,
@@ -255,6 +294,9 @@ class EvidenceOracle(gl.contract.Contract):
             # GenVM pins the clock to the transaction time, so all nodes agree.
             checked_at=datetime.now(timezone.utc).isoformat(),
         )
+        if result["verdict"] == UNAVAILABLE:
+            # Possibly transient (rate limit, outage): report it, keep nothing.
+            return self._to_dict(record, stored=False)
         self.checks[check_id] = record
         self.check_ids.append(check_id)
         return self._to_dict(record)
@@ -284,7 +326,11 @@ class EvidenceOracle(gl.contract.Contract):
             raise gl.vm.UserError("Index out of range")
         return self.check_ids[index]
 
-    def _to_dict(self, record: Check) -> dict[str, str]:
+    @gl.public.view
+    def get_evidence_limit(self) -> int:
+        return MAX_EVIDENCE_CHARS
+
+    def _to_dict(self, record: Check, stored: bool = True) -> dict[str, str]:
         return {
             "check_id": record.check_id,
             "requester": record.requester,
@@ -298,4 +344,5 @@ class EvidenceOracle(gl.contract.Contract):
             "content_hash": record.content_hash,
             "http_status": record.http_status,
             "checked_at": record.checked_at,
+            "stored": "true" if stored else "false",
         }
